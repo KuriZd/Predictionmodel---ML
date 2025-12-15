@@ -10,21 +10,30 @@ import matplotlib.pyplot as plt
 LABELS = {0: "Bajo", 1: "Medio", 2: "Alto"}
 
 
-def prepare_from_population_csv(df: pd.DataFrame, year_min: int, year_max: int) -> pd.DataFrame:
-    df = df.rename(
-        columns={
-            "Entity": "region",
-            "Year": "year",
-            "Population (historical)": "population",
-        }
-    )
+def prepare_generic_timeseries(
+    raw: pd.DataFrame,
+    region_col: str | None,
+    year_col: str,
+    value_col: str,
+    year_min: int,
+    year_max: int,
+) -> pd.DataFrame:
+    df = raw.copy()
 
-    need = {"region", "year", "population"}
+    # Renombrar a nombres internos estándar
+    rename_map = {year_col: "year", value_col: "population"}
+    if region_col:
+        rename_map[region_col] = "region"
+    df = df.rename(columns=rename_map)
+
+    need = {"year", "population"}
     if not need.issubset(df.columns):
         missing = sorted(list(need - set(df.columns)))
-        raise ValueError(f"Faltan columnas: {missing}")
+        raise ValueError(f"Faltan columnas requeridas: {missing}")
 
-    df = df[["region", "year", "population"]].copy()
+    keep = ["year", "population"] + (["region"] if "region" in df.columns else [])
+    df = df[keep].copy()
+
     df["year"] = pd.to_numeric(df["year"], errors="coerce")
     df["population"] = pd.to_numeric(df["population"], errors="coerce")
     df = df.dropna()
@@ -32,22 +41,32 @@ def prepare_from_population_csv(df: pd.DataFrame, year_min: int, year_max: int) 
     df["year"] = df["year"].astype(int)
     df = df[(df["year"] >= year_min) & (df["year"] <= year_max)].copy()
 
-    df = df.sort_values(["region", "year"])
-    df["pop_lag1"] = df.groupby("region")["population"].shift(1)
-    df["pop_lag2"] = df.groupby("region")["population"].shift(2)
+    # Features (con o sin region)
+    if "region" in df.columns:
+        df = df.sort_values(["region", "year"])
+        df["pop_lag1"] = df.groupby("region")["population"].shift(1)
+        df["pop_lag2"] = df.groupby("region")["population"].shift(2)
+        df["growth_rate"] = np.where(
+            df["pop_lag1"] == 0, np.nan, (df["population"] - df["pop_lag1"]) / df["pop_lag1"]
+        )
+        df["growth_lag1"] = df.groupby("region")["growth_rate"].shift(1)
+    else:
+        df = df.sort_values(["year"])
+        df["pop_lag1"] = df["population"].shift(1)
+        df["pop_lag2"] = df["population"].shift(2)
+        df["growth_rate"] = np.where(
+            df["pop_lag1"] == 0, np.nan, (df["population"] - df["pop_lag1"]) / df["pop_lag1"]
+        )
+        df["growth_lag1"] = df["growth_rate"].shift(1)
 
-    df["growth_rate"] = np.where(
-        df["pop_lag1"] == 0,
-        np.nan,
-        (df["population"] - df["pop_lag1"]) / df["pop_lag1"],
-    )
+    df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
 
-    df["growth_lag1"] = df.groupby("region")["growth_rate"].shift(1)
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna().reset_index(drop=True)
+    # One-hot solo si existe region
+    if "region" in df.columns:
+        df = pd.get_dummies(df, columns=["region"], drop_first=True)
 
-    df = pd.get_dummies(df, columns=["region"], drop_first=True)
     return df
+
 
 
 st.set_page_config(page_title="Predicción Índice de Crecimiento", layout="wide")
@@ -85,23 +104,52 @@ else:
 
 st.divider()
 
-uploaded = st.file_uploader("Carga tu archivo CSV (population.csv)", type=["csv"])
+uploaded = st.file_uploader("Carga tu archivo CSV", type=["csv"])
 year_min, year_max = st.slider("Rango de años (dashboard)", 1800, 2023, (1950, 2023))
 
 if uploaded:
     raw = pd.read_csv(uploaded)
+    cols = raw.columns.tolist()
+
+    st.subheader("Mapeo de columnas (elige qué significa cada columna)")
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        region_col = st.selectbox("Columna región (opcional)", ["(ninguna)"] + cols, index=0)
+    with c2:
+        year_col = st.selectbox("Columna año/tiempo", cols, index=0)
+    with c3:
+        value_col = st.selectbox("Columna valor numérico", cols, index=0)
+
+    region_col = None if region_col == "(ninguna)" else region_col
+
+    # ✅ Validaciones (EVITA colisiones como Entity=year y Entity=population)
+    if year_col == value_col:
+        st.error("La columna año/tiempo y la columna valor numérico NO pueden ser la misma.")
+        st.stop()
+
+    if region_col and region_col == year_col:
+        st.error("La columna región no puede ser la misma que la de año/tiempo.")
+        st.stop()
+
+    if region_col and region_col == value_col:
+        st.error("La columna región no puede ser la misma que la del valor numérico.")
+        st.stop()
 
     st.subheader("Resumen estadístico")
     try:
-        tmp = raw.rename(
-            columns={"Entity": "region", "Year": "year", "Population (historical)": "population"}
-        )
-        st.dataframe(tmp[["region", "year", "population"]].describe(include="all").T)
+        tmp = raw.rename(columns={
+            (region_col or ""): "region",
+            year_col: "year",
+            value_col: "population",
+        })
+        show_cols = ["year", "population"] + (["region"] if region_col else [])
+        st.dataframe(tmp[show_cols].describe(include="all").T)
     except Exception:
         st.dataframe(raw.describe(include="all").T)
 
     try:
-        df = prepare_from_population_csv(raw, year_min, year_max)
+        df = prepare_generic_timeseries(raw, region_col, year_col, value_col, year_min, year_max)
     except Exception as e:
         st.error(str(e))
         st.stop()
@@ -123,14 +171,13 @@ if uploaded:
         st.write(pd.Series(pred_nn).map(LABELS).value_counts())
 
     st.subheader("Gráfica (growth_rate)")
-
     chart_height = st.slider("Altura de la gráfica (px)", 160, 520, 220, 10)
 
     plot = df[["year", "growth_rate"]].copy()
     plot = plot.sort_values("year").groupby("year", as_index=False)["growth_rate"].mean()
     plot = plot.set_index("year")
-
     st.line_chart(plot, height=chart_height)
 
 else:
-    st.info("Sube el population.csv para ver estadísticas y predicciones.")
+    st.info("Sube un CSV para ver estadísticas y predicciones.")
+
